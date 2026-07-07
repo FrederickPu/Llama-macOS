@@ -40,6 +40,14 @@
 
 using json = nlohmann::ordered_json;
 
+#ifdef LLAMA_SERVER_CONTEXT_HOOKS_INCLUDE
+#include LLAMA_SERVER_CONTEXT_HOOKS_INCLUDE
+#else
+static std::string server_context_hook_task_created(int, const json &, bool, int) { return {}; }
+static bool server_context_hook_prefill_complete(int, const llama_tokens &) { return false; }
+static std::string server_context_hook_take_initial_stream_prefix(int) { return {}; }
+#endif
+
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 static uint32_t server_n_outputs_max(const common_params & params) {
@@ -422,13 +430,13 @@ struct server_slot {
 
         timings.prompt_n            = n_prompt_tokens_processed;
         timings.prompt_ms           = t_prompt_processing;
-        timings.prompt_per_token_ms = t_prompt_processing / n_prompt_tokens_processed;
-        timings.prompt_per_second   = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+        timings.prompt_per_token_ms = n_prompt_tokens_processed > 0 ? t_prompt_processing / n_prompt_tokens_processed : 0.0;
+        timings.prompt_per_second   = t_prompt_processing > 0.0 ? 1e3 / t_prompt_processing * n_prompt_tokens_processed : 0.0;
 
         timings.predicted_n            = n_decoded;
         timings.predicted_ms           = t_token_generation;
-        timings.predicted_per_token_ms = t_token_generation / n_decoded;
-        timings.predicted_per_second   = 1e3 / t_token_generation * n_decoded;
+        timings.predicted_per_token_ms = n_decoded > 0 ? t_token_generation / n_decoded : 0.0;
+        timings.predicted_per_second   = t_token_generation > 0.0 ? 1e3 / t_token_generation * n_decoded : 0.0;
 
         // Add speculative metrics
         if (n_draft_total > 0) {
@@ -3458,6 +3466,20 @@ private:
 
                     GGML_ASSERT(slot.task->need_sampling());
 
+                    if (server_context_hook_prefill_complete(slot.task->id, slot.prompt.tokens.get_text_tokens())) {
+                        const int64_t t_current = ggml_time_us();
+                        slot.t_start_generation = t_current;
+                        slot.t_prompt_processing = (t_current - slot.t_start_process_prompt) / 1e3;
+                        slot.t_token_generation = 0.0;
+                        slot.stop = STOP_TYPE_EOS;
+                        send_final_response(slot);
+                        metrics.on_prompt_eval(slot);
+                        metrics.on_prediction(slot);
+                        slot.release();
+                        slot.i_batch = -1;
+                        continue;
+                    }
+
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
 
@@ -3810,6 +3832,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     auto & rd = res->rd;
     auto & params = this->params;
 
+    const bool stream = json_value(data, "stream", false);
+    int first_task_id = -1;
+
     try {
         std::vector<server_task> tasks;
 
@@ -3866,6 +3891,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.id_slot = json_value(data, "id_slot", -1);
 
+            const std::string hook_error = server_context_hook_task_created(task.id, data, stream, task.params.n_cmpl);
+            if (!hook_error.empty()) {
+                throw std::invalid_argument(hook_error);
+            }
+
             // OAI-compat
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
@@ -3882,13 +3912,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             tasks.push_back(std::move(task));
         }
 
+        first_task_id = tasks.empty() ? -1 : tasks[0].id;
         rd.post_tasks(std::move(tasks));
     } catch (const std::exception & e) {
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
-
-    bool stream = json_value(data, "stream", false);
 
     if (!stream) {
         // non-stream, wait for the results
@@ -3952,6 +3981,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         } else {
             res->data = format_oai_sse(first_result_json);
         }
+        res->data = server_context_hook_take_initial_stream_prefix(first_task_id) + res->data;
         res->status = 200;
         res->content_type = "text/event-stream";
         res->next = [res_this = res.get(), res_type, &req, &params](std::string & output) -> bool {
