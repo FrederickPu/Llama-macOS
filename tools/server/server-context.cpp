@@ -44,7 +44,7 @@ using json = nlohmann::ordered_json;
 #include LLAMA_SERVER_CONTEXT_HOOKS_INCLUDE
 #else
 static std::string server_context_hook_task_created(int, const json &, bool, int) { return {}; }
-static bool server_context_hook_prefill_complete(int, const llama_tokens &) { return false; }
+static void server_context_hook_prefill_complete(int, const llama_tokens &) {}
 static std::string server_context_hook_take_initial_stream_prefix(int) { return {}; }
 #endif
 
@@ -430,13 +430,13 @@ struct server_slot {
 
         timings.prompt_n            = n_prompt_tokens_processed;
         timings.prompt_ms           = t_prompt_processing;
-        timings.prompt_per_token_ms = n_prompt_tokens_processed > 0 ? t_prompt_processing / n_prompt_tokens_processed : 0.0;
-        timings.prompt_per_second   = t_prompt_processing > 0.0 ? 1e3 / t_prompt_processing * n_prompt_tokens_processed : 0.0;
+        timings.prompt_per_token_ms = t_prompt_processing / n_prompt_tokens_processed;
+        timings.prompt_per_second   = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
 
         timings.predicted_n            = n_decoded;
         timings.predicted_ms           = t_token_generation;
-        timings.predicted_per_token_ms = n_decoded > 0 ? t_token_generation / n_decoded : 0.0;
-        timings.predicted_per_second   = t_token_generation > 0.0 ? 1e3 / t_token_generation * n_decoded : 0.0;
+        timings.predicted_per_token_ms = t_token_generation / n_decoded;
+        timings.predicted_per_second   = 1e3 / t_token_generation * n_decoded;
 
         // Add speculative metrics
         if (n_draft_total > 0) {
@@ -3466,19 +3466,7 @@ private:
 
                     GGML_ASSERT(slot.task->need_sampling());
 
-                    if (server_context_hook_prefill_complete(slot.task->id, slot.prompt.tokens.get_text_tokens())) {
-                        const int64_t t_current = ggml_time_us();
-                        slot.t_start_generation = t_current;
-                        slot.t_prompt_processing = (t_current - slot.t_start_process_prompt) / 1e3;
-                        slot.t_token_generation = 0.0;
-                        slot.stop = STOP_TYPE_EOS;
-                        send_final_response(slot);
-                        metrics.on_prompt_eval(slot);
-                        metrics.on_prediction(slot);
-                        slot.release();
-                        slot.i_batch = -1;
-                        continue;
-                    }
+                    server_context_hook_prefill_complete(slot.task->id, slot.prompt.tokens.get_text_tokens());
 
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
